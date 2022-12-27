@@ -1,52 +1,66 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.Extensions.Configuration;
 using Twilio.Security;
 
-namespace TwitterFeedback;
-
-[AttributeUsage(AttributeTargets.Method)]
-public class ValidateTwilioRequestAttribute : ActionFilterAttribute
+namespace TwitterFeedback
 {
-    private readonly RequestValidator _requestValidator;
-
-    private static IConfigurationRoot Configuration =>
-        new ConfigurationBuilder()
-            .SetBasePath(Directory.GetCurrentDirectory())
-            .AddJsonFile("appsettings.json", true, true).Build();
-
-    public ValidateTwilioRequestAttribute()
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Method)]
+    public class ValidateTwilioRequestAttribute : TypeFilterAttribute
     {
-        var authToken = Configuration["TwilioAuthToken"];
-        _requestValidator = new RequestValidator(authToken);
+        public ValidateTwilioRequestAttribute() : base(typeof(ValidateTwilioRequestFilter))
+        {
+        }
     }
 
-    public override void OnActionExecuting(ActionExecutingContext actionContext)
+    internal class ValidateTwilioRequestFilter : IAsyncActionFilter
     {
-        var context = actionContext.HttpContext;
-        if (!IsValidRequest(context.Request))
+        private readonly RequestValidator _requestValidator;
+        private readonly bool _isEnabled;
+
+        public ValidateTwilioRequestFilter(IConfiguration configuration, IWebHostEnvironment environment)
         {
-            actionContext.HttpContext.Response.StatusCode = StatusCodes.Status403Forbidden;
+            var authToken = configuration["Twilio:AuthToken"] ?? throw new Exception("'Twilio:AuthToken' not configured.");
+            _requestValidator = new RequestValidator(authToken);
+            _isEnabled = configuration.GetValue("Twilio:RequestValidation:Enabled", true);
         }
 
-        base.OnActionExecuting(actionContext);
-    }
+        public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
+        {
+            if (!_isEnabled)
+            {
+                await next();
+                return;
+            }
+            
+            var httpContext = context.HttpContext;
+            var request = httpContext.Request;
+        
+            var requestUrl = $"{request.Scheme}://{request.Host}{request.Path}{request.QueryString}";
+            Dictionary<string, string> parameters = null;
+        
+            if (request.HasFormContentType)
+            {
+                var form = await request.ReadFormAsync(httpContext.RequestAborted).ConfigureAwait(false);
+                parameters = form.ToDictionary(p => p.Key, p => p.Value.ToString());
+            }
 
-    private bool IsValidRequest(HttpRequest request)
-    {
-        var requestUrl = RequestRawUrl(request);
-        var parameters = ToDictionary(request.Form);
-        var signature = request.Headers["X-Twilio-Signature"];
-        return _requestValidator.Validate(requestUrl, parameters, signature);
-    }
+            var signature = request.Headers["X-Twilio-Signature"];
+            var isValid = _requestValidator.Validate(requestUrl, parameters, signature);
+        
+            if (!isValid)
+            {
+                httpContext.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
 
-    private static string RequestRawUrl(HttpRequest request)
-    {
-        return $"{request.Scheme}://{request.Host}{request.Path}{request.QueryString}";
-    }
-
-    private static IDictionary<string, string> ToDictionary(IFormCollection collection)
-    {
-        return collection.Keys
-            .Select(key => new {Key = key, Value = collection[key]})
-            .ToDictionary(p => p.Key, p => p.Value.ToString());
+            await next();
+        }
     }
 }
